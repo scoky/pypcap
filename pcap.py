@@ -317,7 +317,16 @@ SUPPORT_NETWORK_TYPES = {
 ### Transport Layer ###
 
 class TransportHeader(Header):
-  pass
+  # Assumption that all implementations of transport will have src_port and dst_port fields
+  @property
+  def next_protocol(self):
+    # Match on port
+    if self.dst_port in SUPPORT_APP_TYPES:
+      return SUPPORT_APP_TYPES[self.dst_port]
+    elif self.src_port in SUPPORT_APP_TYPES:
+      return SUPPORT_APP_TYPES[self.src_port]
+    else:
+      return None
 
 class UDPHeader(TransportHeader):
   def __init__(self):
@@ -330,16 +339,6 @@ class UDPHeader(TransportHeader):
     )
 
   TYPE = 17
-
-  @property
-  def next_protocol(self):
-    # Match on port
-    if self.dst_port in SUPPORT_APP_TYPES:
-      return SUPPORT_APP_TYPES[self.dst_port]
-    elif self.src_port in SUPPORT_APP_TYPES:
-      return SUPPORT_APP_TYPES[self.src_port]
-    else:
-      return None
 
 class TCPHeader(TransportHeader):
   def __init__(self):
