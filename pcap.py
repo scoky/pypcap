@@ -8,13 +8,13 @@ import time
 class Header(object):
   def __init__(self, *args, **kwargs):
     self.payload = None
-    self.fields = [f[0] for f in args]
+    self._fields = [f[0] for f in args]
     self._fmt = (kwargs['endian'] if 'endian' in kwargs else '') + ''.join([f[1] for f in args])
     for f in args:
       setattr(self, f[0], 0x0 if f[1] in 'IHB' else None)
 
   def from_wire(self, buf, ofs = 0):
-    for f, val in izip(self.fields, struct.unpack_from(self._fmt, buf, ofs)):
+    for f, val in izip(self._fields, struct.unpack_from(self._fmt, buf, ofs)):
       setattr(self, f, val)
     self.payload = buffer(buf, ofs + struct.calcsize(self._fmt))
     self._post_from_wire(self.payload, 0)
@@ -33,7 +33,7 @@ class Header(object):
         raise KeyError
 
   def to_wire(self, buf, ofs = 0):
-    struct.pack_into(self._fmt, buf, ofs, *[getattr(self, f) for f in self.fields])
+    struct.pack_into(self._fmt, buf, ofs, *[getattr(self, f) for f in self._fields])
     self._post_to_wire(buf, ofs + struct.calcsize(self._fmt))
 
   def _post_to_wire(self, buf, ofs):
@@ -41,6 +41,10 @@ class Header(object):
 
   def __str__(self):
     return '{0} [ {1} ]'.format(self.__class__, ', '.join(['{0} = \'{1}\''.format(f, self._format_field(getattr(self, f))) for f in self.fields]))
+
+  @property
+  def fields(self):
+    return self._fields
 
   def _format_field(self, field):
     if field is None:
@@ -198,7 +202,7 @@ class IPv4Header(NetworkHeader):
   def flags(self):
     return self.flg_ofs >> 13
 
-  @ecn.setter
+  @flags.setter
   def flags(self, v):
     self.flg_ofs = (self.flg_ofs & 0x1fff) | ((v << 13) & 0xe000)
 
@@ -206,7 +210,7 @@ class IPv4Header(NetworkHeader):
   def frag_offset(self):
     return self.flg_ofs & 0x1fff
 
-  @ecn.setter
+  @frag_offset.setter
   def frag_offset(self, v):
     self.flg_ofs = (self.flg_ofs & 0xe000) | (v & 0x1fff)
 
@@ -218,6 +222,21 @@ class IPv4Header(NetworkHeader):
 
   def _str_to_ip(self, string):
     return struct.unpack("!I", socket.inet_pton(socket.AF_INET, ip))[0]
+
+  @property
+  def fields(self):
+    for f in super(IPv4Header, self).fields:
+      if f == 'ver_len':
+        yield 'version'
+        yield 'ihl'
+      elif f == 'diff_ecn':
+        yield 'diffserv'
+        yield 'ecn'
+      elif f == 'flg_ofs':
+        yield 'flags'
+        yield 'frag_offset'
+      else:
+        yield f
 
   @property
   def next_protocol(self):
@@ -272,6 +291,16 @@ class IPv6Header(NetworkHeader):
     return (hi << 64) | lo
 
   @property
+  def fields(self):
+    for f in super(IPv6Header, self).fields:
+      if f == 'ver_class_flow':
+        yield 'version'
+        yield 'traffic_class'
+        yield 'flow_label'
+      else:
+        yield f
+
+  @property
   def next_protocol(self):
     # NB: May actually be an extension header, but lets ignore that for now
     if self.next_header in SUPPORT_TRANSPORT_TYPES:
@@ -311,6 +340,87 @@ class UDPHeader(TransportHeader):
       return SUPPORT_APP_TYPES[self.src_port]
     else:
       return None
+
+class TCPHeader(TransportHeader):
+  def __init__(self):
+    super(TCPHeader, self).__init__(
+      ('src_port', 'H'),
+      ('dst_port', 'H'),
+      ('seqnum', 'I'),
+      ('acknum', 'I'),
+      ('rawflags', 'H'),
+      ('window', 'H'),
+      ('chksum', 'H'),
+      ('urgptr', 'H'),
+      endian = '!'
+    )
+    self.options = []
+    self.padding = buffer('')
+
+  TYPE = 6
+
+  @property
+  def data_offset(self):
+    return self.rawflags >> 12
+
+  @data_offset.setter
+  def data_offset(self, val):
+    self.rawflags = (self.rawflags & 0x0fff) | ((val << 12) & 0xf000)
+
+  @property
+  def reserved(self):
+    return (self.rawflags >> 6) & 0x003f
+
+  @reserved.setter
+  def reserved(self, val):
+    self.rawflags = (self.rawflags & 0xf03f) | ((val << 6) & 0x0fc0)
+
+  @property
+  def flags(self):
+    return self.rawflags & 0x003f
+
+  @flags.setter
+  def flags(self, val):
+    self.rawflags = (self.rawflags & 0xffc0) | (val & 0x003f)
+
+  def _post_from_wire(self, buf, ofs):
+    opt_len = (self.data_offset - 5) * 4
+    i_ofs = ofs
+    while ofs < i_ofs + opt_len:
+      kind = struct.unpack_from('!B', buf, ofs)[0]
+      ofs += 1
+      if kind == 0x0: # end of options
+        self.options.append((kind, buffer(buf, ofs, 0)))
+        break
+      elif kind == 0x1: # noop
+        self.options.append((kind, buffer(buf, ofs, 0)))
+      else:
+        length = struct.unpack_from('!B', buf, ofs)[0]
+        ofs += 1
+        self.options.append((kind, buffer(buf, ofs, length - 2)))
+        ofs += length - 2
+    self.padding = buffer(buf, ofs, opt_len - (ofs - i_ofs))
+
+  def _post_to_wire(self, buf, ofs):
+    for opt in self.options:
+      struct.pack_into('!BB', buf, ofs, opt[0], len(opt[1] + 2))
+      ofs += 2
+      buf[ofs:ofs+len(opt)] = opt[1]
+      ofs += len(opt)
+    buf[ofs:ofs+len(self.padding)] = self.padding
+
+  def __len__(self):
+    return 20 + sum(len(opt[1]) + 2 for opt in self.options) + len(self.padding)
+
+  @property
+  def fields(self):
+    for f in super(TCPHeader, self).fields:
+      if f == 'rawflags':
+        yield 'data_offset'
+        yield 'reserved'
+        yield 'flags'
+      else:
+        yield f
 
 SUPPORT_TRANSPORT_TYPES = {
   subclass.TYPE : subclass for subclass in TransportHeader.__subclasses__()
